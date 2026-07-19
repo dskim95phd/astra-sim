@@ -212,6 +212,9 @@ void Workload::issue_mem(shared_ptr<Chakra::ETFeederNode> node) {
     wlhd->workload = this;
     wlhd->node_id = node->id();
     wlhd->device_id = node->tensor_device();
+    wlhd->host_transfer =
+        node->name().find("KV_EVICT_CPU") != string::npos ||
+        node->name().find("KV_RELOAD_CPU") != string::npos;
     if (node->type() == ChakraNodeType::PIM_COMP_NODE) { // pim implementation
         wlhd->pim_enabled = true;
         wlhd->pim_channel_id = node->tensor_channel();

@@ -20,6 +20,7 @@ class WorkloadLayerHandlerData : public BasicEventHandlerData, public MetaData {
     uint64_t node_id;
     uint32_t device_id;
     bool pim_enabled;
+    bool host_transfer;
     uint32_t pim_channel_id;
     uint64_t pim_runtime;
     WorkloadLayerHandlerData();
