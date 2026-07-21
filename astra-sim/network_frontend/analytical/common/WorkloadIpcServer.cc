@@ -23,7 +23,7 @@ namespace AstraSimAnalytical {
 namespace {
 
 constexpr std::array<std::uint8_t, 4> kMagic = {'L', 'S', 'I', 'M'};
-constexpr std::uint16_t kProtocolVersion = 1;
+constexpr std::uint16_t kProtocolVersion = 2;
 constexpr std::size_t kHeaderSize = 16;
 constexpr std::uint64_t kMaxPayloadBytes = 64ULL * 1024ULL * 1024ULL;
 
@@ -85,6 +85,23 @@ void write_u64(std::uint8_t* destination, std::uint64_t value) {
         destination[index] = static_cast<std::uint8_t>(value & 0xff);
         value >>= 8;
     }
+}
+
+std::string targeted_command(std::uint32_t system_id,
+                             const std::string& command) {
+    return "@" + std::to_string(system_id) + "\t" + command;
+}
+
+llmservingsim::ipc::SystemCommand parse_system_command(
+    const std::vector<std::uint8_t>& payload,
+    const char* command_name) {
+    llmservingsim::ipc::SystemCommand request;
+    if (!request.ParseFromArray(payload.data(), payload.size()) ||
+        request.request_id() == 0) {
+        throw std::runtime_error(
+            std::string(command_name) + " payload is not valid protobuf");
+    }
+    return request;
 }
 
 }  // namespace
@@ -216,39 +233,87 @@ std::string WorkloadIpcServer::receive_file_command() {
             register_template(frame.payload);
             continue;
         case WorkloadMessageType::RunBatch:
-            if (prepare_batch(frame.payload)) {
-                return kPreparedBatchCommand;
+            {
+              llmservingsim::ipc::RunBatch request;
+              if (!request.ParseFromArray(
+                      frame.payload.data(), frame.payload.size()) ||
+                  request.request_id() == 0) {
+                  send_error("RUN_BATCH payload is not valid protobuf");
+                  throw std::runtime_error("Invalid RUN_BATCH payload");
+              }
+              if (prepare_batch(frame.payload)) {
+                  return targeted_command(
+                      request.controller_system_id(), kPreparedBatchCommand);
+              }
             }
             continue;
         case WorkloadMessageType::RunWave:
-            if (prepare_wave(frame.payload)) {
-                return kPreparedBatchCommand;
+            {
+              llmservingsim::ipc::RunWave request;
+              if (!request.ParseFromArray(
+                      frame.payload.data(), frame.payload.size()) ||
+                  request.request_id() == 0) {
+                  send_error("RUN_WAVE payload is not valid protobuf");
+                  throw std::runtime_error("Invalid RUN_WAVE payload");
+              }
+              if (prepare_wave(frame.payload)) {
+                  return targeted_command(
+                      request.controller_system_id(), kPreparedBatchCommand);
+              }
             }
             continue;
         case WorkloadMessageType::FileWorkload: {
-            if (frame.payload.empty()) {
-                send_error("FILE_WORKLOAD path is empty");
-                throw std::runtime_error("Empty FILE_WORKLOAD path");
+            llmservingsim::ipc::FileWorkload request;
+            if (!request.ParseFromArray(
+                    frame.payload.data(), frame.payload.size()) ||
+                request.request_id() == 0 || request.path().empty()) {
+                send_error("FILE_WORKLOAD payload is not valid protobuf");
+                throw std::runtime_error("Invalid FILE_WORKLOAD payload");
             }
-            const std::string path(frame.payload.begin(), frame.payload.end());
-            if (path.find('\0') != std::string::npos) {
-                send_error("FILE_WORKLOAD path contains a null byte");
-                throw std::runtime_error("Invalid FILE_WORKLOAD path");
-            }
-            return path;
+            return targeted_command(request.system_id(), request.path());
         }
-        case WorkloadMessageType::Pass:
-            return "pass";
-        case WorkloadMessageType::Sleep:
-            return "done";
-        case WorkloadMessageType::Exit:
-            return "exit";
-        case WorkloadMessageType::AdvanceTime:
-            if (frame.payload.size() != sizeof(std::uint64_t)) {
-                send_error("ADVANCE_TIME payload must be eight bytes");
+        case WorkloadMessageType::Pass: {
+            try {
+                const auto request = parse_system_command(
+                    frame.payload, "PASS");
+                return targeted_command(request.system_id(), "pass");
+            } catch (const std::exception& error) {
+                send_error(error.what());
+                throw;
+            }
+        }
+        case WorkloadMessageType::Sleep: {
+            try {
+                const auto request = parse_system_command(
+                    frame.payload, "SLEEP");
+                return targeted_command(request.system_id(), "done");
+            } catch (const std::exception& error) {
+                send_error(error.what());
+                throw;
+            }
+        }
+        case WorkloadMessageType::Exit: {
+            try {
+                const auto request = parse_system_command(
+                    frame.payload, "EXIT");
+                return targeted_command(request.system_id(), "exit");
+            } catch (const std::exception& error) {
+                send_error(error.what());
+                throw;
+            }
+        }
+        case WorkloadMessageType::AdvanceTime: {
+            llmservingsim::ipc::AdvanceTime request;
+            if (!request.ParseFromArray(
+                    frame.payload.data(), frame.payload.size()) ||
+                request.request_id() == 0) {
+                send_error("ADVANCE_TIME payload is not valid protobuf");
                 throw std::runtime_error("Invalid ADVANCE_TIME payload");
             }
-            return "advance:" + std::to_string(read_u64(frame.payload.data()));
+            return targeted_command(
+                request.system_id(),
+                "advance:" + std::to_string(request.current_time_ns()));
+        }
         default:
             send_error("Message is not supported by the file bridge");
             throw std::runtime_error(

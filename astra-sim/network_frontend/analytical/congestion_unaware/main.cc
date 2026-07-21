@@ -227,12 +227,7 @@ int main(int argc, char* argv[]) {
       std::getline(std::cin, command);
       return command;
     };
-    auto decode_workload_command = [&workload_ipc_server](
-                                       std::string command,
-                                       int fallback_system_id) {
-      if (workload_ipc_server) {
-        return std::make_pair(fallback_system_id, std::move(command));
-      }
+    auto decode_workload_command = [](std::string command) {
       if (command.empty() || command.front() != '@') {
         throw std::invalid_argument(
             "Legacy workload command has no target system id");
@@ -389,10 +384,8 @@ int main(int argc, char* argv[]) {
             start_npu_ids.begin(), start_npu_ids.end(), report_pending_for) ||
             std::any_of(
                 end_npu_ids.begin(), end_npu_ids.end(), report_pending_for);
-        if (!workload_ipc_server && !completion_report_pending &&
-            has_pending_workload_command()) {
-          auto command = decode_workload_command(
-              read_workload_command(), -1);
+        if (!completion_report_pending && has_pending_workload_command()) {
+          auto command = decode_workload_command(read_workload_command());
           exit = apply_workload_command(command.first, command.second);
         } else if (workload_ipc_server &&
             !completion_report_pending &&
@@ -410,71 +403,54 @@ int main(int argc, char* argv[]) {
         }
       }
 
-      for (std::size_t idx = 0; idx < end_npu_ids.size(); ++idx) {
-        int npu_id = end_npu_ids[idx];
-        cout << "Checking End NPU " << npu_id << " ..." << endl;
-        // Only proceed if the workload has finished its iteration
-        if (!systems[npu_id]->workload->is_sleep && systems[npu_id]->workload->is_finished) {
-          if (last_command_iteration[npu_id] ==
-                  systems[npu_id]->workload->iteration &&
-              (!workload_ipc_server ||
-               (!workload_ipc_server->has_pending_completion(npu_id) &&
-                !has_pending_workload_command()))) {
-            continue;
-          }
-          systems[npu_id]->workload->report();
-          if (workload_ipc_server) {
-            const auto cycles = Sys::boostedTick();
-            workload_ipc_server->send_batch_done(
-                npu_id, cycles,
-                cycles - systems[npu_id]->workload->hw_resource->tics_gpu_ops);
-          }
-          AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
-
-          auto command = decode_workload_command(
-              read_workload_command(), npu_id);
-          last_command_iteration[npu_id] =
-              systems[npu_id]->workload->iteration;
-          exit = apply_workload_command(command.first, command.second);
-          if (exit) {
-            break;
-          }
+      // Freeze every completion visible at this simulated timestamp before
+      // applying any host command. Applying a fast direct-mode command while
+      // scanning the remaining systems made BATCH_DONE ordering depend on
+      // host/socket timing, which changed PD routing at equal timestamps.
+      std::vector<int> completion_frontier;
+      const auto collect_completion = [&](int npu_id) {
+        if (std::find(completion_frontier.begin(), completion_frontier.end(),
+                      npu_id) != completion_frontier.end()) {
+          return;
         }
+        const auto* workload = systems[npu_id]->workload;
+        if (workload->is_sleep || !workload->is_finished) {
+          return;
+        }
+        if (last_command_iteration[npu_id] == workload->iteration &&
+            (!workload_ipc_server ||
+             !workload_ipc_server->has_pending_completion(npu_id))) {
+          return;
+        }
+        completion_frontier.push_back(npu_id);
+      };
+      for (int npu_id : end_npu_ids) {
+        cout << "Checking End NPU " << npu_id << " ..." << endl;
+        collect_completion(npu_id);
       }
-      
-      if (exit) {
-        break;
+      for (int npu_id : start_npu_ids) {
+        cout << "Checking Managed Systems for Controller NPU " << npu_id
+             << " ..." << endl;
+        collect_completion(npu_id);
       }
 
-      for (std::size_t idx = 0; idx < start_npu_ids.size(); ++idx) {
-        int npu_id = start_npu_ids[idx];
-        // Only proceed if the workload has finished its iteration
-        cout << "Checking Managed Systems for Controller NPU " << npu_id << " ..." << endl;
-        if (!systems[npu_id]->workload->is_sleep && systems[npu_id]->workload->is_finished) {
-          if (last_command_iteration[npu_id] ==
-                  systems[npu_id]->workload->iteration &&
-              (!workload_ipc_server ||
-               (!workload_ipc_server->has_pending_completion(npu_id) &&
-                !has_pending_workload_command()))) {
-            continue;
-          }
-          systems[npu_id]->workload->report();
-          if (workload_ipc_server) {
-            const auto cycles = Sys::boostedTick();
-            workload_ipc_server->send_batch_done(
-                npu_id, cycles,
-                cycles - systems[npu_id]->workload->hw_resource->tics_gpu_ops);
-          }
-          AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
-
-          auto command = decode_workload_command(
-              read_workload_command(), npu_id);
-          last_command_iteration[npu_id] =
-              systems[npu_id]->workload->iteration;
-          exit = apply_workload_command(command.first, command.second);
-          if (exit) {
-            break;
-          }
+      for (int npu_id : completion_frontier) {
+        systems[npu_id]->workload->report();
+        if (workload_ipc_server) {
+          const auto cycles = Sys::boostedTick();
+          workload_ipc_server->send_batch_done(
+              npu_id, cycles,
+              cycles - systems[npu_id]->workload->hw_resource->tics_gpu_ops);
+        }
+        AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
+      }
+      for (int npu_id : completion_frontier) {
+        auto command = decode_workload_command(read_workload_command());
+        last_command_iteration[npu_id] =
+            systems[npu_id]->workload->iteration;
+        exit = apply_workload_command(command.first, command.second);
+        if (exit) {
+          break;
         }
       }
     }

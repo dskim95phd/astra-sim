@@ -30,7 +30,7 @@ using AstraSimAnalytical::WorkloadIpcServer;
 using AstraSimAnalytical::WorkloadMessageType;
 
 constexpr std::array<std::uint8_t, 4> kMagic = {'L', 'S', 'I', 'M'};
-constexpr std::uint16_t kProtocolVersion = 1;
+constexpr std::uint16_t kProtocolVersion = 2;
 constexpr std::size_t kHeaderSize = 16;
 
 void require(bool condition, const std::string& message) {
@@ -198,7 +198,8 @@ int main() {
                     "Rejected RUN_WAVE left prepared state behind");
 
             require(server.receive_file_command() ==
-                        WorkloadIpcServer::kPreparedBatchCommand,
+                        std::string("@0\t") +
+                            WorkloadIpcServer::kPreparedBatchCommand,
                     "Valid RUN_BATCH did not execute after rejection");
             const auto prepared = server.take_prepared_batch();
             require(prepared.systems.size() == 1 &&
@@ -238,6 +239,7 @@ int main() {
         llmservingsim::ipc::RunWave wave;
         wave.set_request_id(2);
         wave.set_wave_id(41);
+        wave.set_controller_system_id(0);
         auto* valid = wave.add_runs();
         valid->set_instance_id(0);
         valid->mutable_patch()->set_batch_id(10);
@@ -259,6 +261,7 @@ int main() {
         batch.set_request_id(3);
         batch.set_instance_id(0);
         batch.set_execute(true);
+        batch.set_controller_system_id(0);
         batch.mutable_patch()->set_batch_id(12);
         batch.mutable_patch()->set_template_id(ready.template_id());
         batch.mutable_patch()->add_systems()->set_system_id(0);
