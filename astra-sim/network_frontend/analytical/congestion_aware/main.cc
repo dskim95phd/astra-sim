@@ -4,15 +4,20 @@ LICENSE file in the root directory of this source tree.
 *******************************************************************************/
 
 #include "astra-sim/common/Logging.hh"
+#include "astra-sim/workload/PreparedFeeder.hh"
 #include "common/CmdLineParser.hh"
+#include "common/WorkloadIpcServer.hh"
 #include "congestion_aware/CongestionAwareNetworkApi.hh"
 #include <astra-network-analytical/common/EventQueue.h>
 #include <astra-network-analytical/common/NetworkParser.h>
 #include <astra-network-analytical/congestion_aware/Helper.h>
 #include <memory_backend/analytical/AnalyticalMemory.hh>
 #include <json/json.hpp>
+#include <cerrno>
+#include <poll.h>
 #include <unistd.h>
 #include <iostream>
+#include <sstream>
 
 using namespace AstraSim;
 using namespace Analytical;
@@ -70,6 +75,8 @@ int main(int argc, char* argv[]) {
         cmd_line_parser.get<std::vector<int>>("start-npu-ids");
     auto end_npu_ids =
         cmd_line_parser.get<std::vector<int>>("end-npu-ids");
+    const auto workload_ipc_socket =
+        cmd_line_parser.get<std::string>("workload-ipc-socket");
 
     // clear vector if default value is used
     if (start_npu_ids.size() == 1 && start_npu_ids[0] == -1) {
@@ -205,6 +212,148 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    std::unique_ptr<WorkloadIpcServer> workload_ipc_server;
+    if (!workload_ipc_socket.empty()) {
+      workload_ipc_server =
+          std::make_unique<WorkloadIpcServer>(workload_ipc_socket);
+      workload_ipc_server->start();
+      workload_ipc_server->accept_client();
+      workload_ipc_server->handshake();
+    }
+    auto read_workload_command = [&workload_ipc_server]() {
+      if (workload_ipc_server) {
+        return workload_ipc_server->receive_file_command();
+      }
+      std::string command;
+      std::getline(std::cin, command);
+      return command;
+    };
+    auto decode_workload_command = [&workload_ipc_server](
+                                       std::string command,
+                                       int fallback_system_id) {
+      if (workload_ipc_server) {
+        return std::make_pair(fallback_system_id, std::move(command));
+      }
+      if (command.empty() || command.front() != '@') {
+        throw std::invalid_argument(
+            "Legacy workload command has no target system id");
+      }
+      const auto separator = command.find('\t');
+      if (separator == std::string::npos || separator <= 1) {
+        throw std::invalid_argument(
+            "Legacy workload command has invalid target framing");
+      }
+      const auto system_id = std::stoi(command.substr(1, separator - 1));
+      return std::make_pair(system_id, command.substr(separator + 1));
+    };
+    auto has_pending_workload_command = [&workload_ipc_server]() {
+      if (workload_ipc_server) {
+        return workload_ipc_server->has_pending_input();
+      }
+      pollfd descriptor{};
+      descriptor.fd = STDIN_FILENO;
+      descriptor.events = POLLIN;
+      const auto result = ::poll(&descriptor, 1, 0);
+      return result > 0 && (descriptor.revents & POLLIN) != 0;
+    };
+    auto wait_for_workload_command = [&workload_ipc_server]() {
+      if (workload_ipc_server) {
+        workload_ipc_server->wait_for_input();
+        return;
+      }
+      pollfd descriptor{};
+      descriptor.fd = STDIN_FILENO;
+      descriptor.events = POLLIN;
+      while (::poll(&descriptor, 1, -1) < 0 && errno == EINTR) {
+      }
+    };
+    auto install_prepared_batch = [&workload_ipc_server, &systems,
+                                   npus_count]() {
+      auto prepared = workload_ipc_server->take_prepared_batch();
+      std::vector<AstraSim::Workload*> workloads;
+      workloads.reserve(prepared.systems.size());
+      for (auto& prepared_system : prepared.systems) {
+        if (prepared_system.system_id >= static_cast<std::uint32_t>(npus_count)) {
+          throw std::out_of_range("Prepared batch system id is out of range");
+        }
+        auto* workload = systems[prepared_system.system_id]->workload;
+        workload->install_prepared_workload(
+            std::make_unique<AstraSim::PreparedFeeder>(
+                std::move(prepared_system.iteration)));
+        workloads.emplace_back(workload);
+      }
+      for (auto* workload : workloads) {
+        workload->fire();
+      }
+    };
+    auto apply_workload_command = [
+        &systems, &start_npu_ids, &managed_systems,
+        &install_prepared_batch, &workload_ipc_server, &event_queue,
+        npus_count](
+        int system_id, const std::string& command) {
+      if (system_id < 0 || system_id >= npus_count) {
+        throw std::out_of_range("Workload command system id is out of range");
+      }
+      if (command == "pass") {
+        return false;
+      }
+      if (command.rfind("advance:", 0) == 0) {
+        event_queue->advance_to(std::stoull(command.substr(8)));
+        return false;
+      }
+      if (command == "exit") {
+        return true;
+      }
+      if (command == "done") {
+        systems[system_id]->workload->is_sleep = true;
+        return false;
+      }
+      if (command == WorkloadIpcServer::kPreparedBatchCommand) {
+        install_prepared_batch();
+        return false;
+      }
+      if (!workload_ipc_server && command.rfind("wave:", 0) == 0) {
+        const auto separator = command.find('\t');
+        if (separator == std::string::npos || separator <= 5) {
+          throw std::invalid_argument("Legacy RUN_WAVE framing is invalid");
+        }
+        const auto path = command.substr(separator + 1);
+        std::stringstream participants(command.substr(5, separator - 5));
+        std::string encoded_system_id;
+        while (std::getline(participants, encoded_system_id, ',')) {
+          const auto participant = std::stoi(encoded_system_id);
+          if (participant < 0 || participant >= npus_count) {
+            throw std::out_of_range(
+                "Legacy RUN_WAVE participant is out of range");
+          }
+          systems[participant]->workload->add_workload(path, {});
+        }
+        return false;
+      }
+
+      std::vector<Sys*> managed;
+      const auto controller = std::find(
+          start_npu_ids.begin(), start_npu_ids.end(), system_id);
+      if (controller != start_npu_ids.end()) {
+        const auto index = static_cast<std::size_t>(
+            std::distance(start_npu_ids.begin(), controller));
+        if (workload_ipc_server) {
+          managed = managed_systems[index];
+        } else {
+          const auto upper_bound =
+              index + 1 < start_npu_ids.size()
+                  ? start_npu_ids[index + 1]
+                  : npus_count;
+          for (int managed_id = system_id + 1;
+               managed_id < upper_bound; ++managed_id) {
+            managed.push_back(systems[managed_id]);
+          }
+        }
+      }
+      systems[system_id]->workload->add_workload(command, managed);
+      return false;
+    };
+
     // Initiate simulation
     for (int i = 0; i < npus_count; i++) {
         systems[i]->workload->fire();
@@ -218,12 +367,48 @@ int main(int argc, char* argv[]) {
     // }
 
     bool exit = false;
+    std::vector<std::int64_t> last_command_iteration(npus_count, -1);
     while (!exit) {
       if(!event_queue->finished()){
         event_queue->proceed();
       }
       else {
-        event_queue->add_current_time();
+        const bool all_workloads_idle = std::all_of(
+            systems.begin(), systems.end(), [](const Sys* system) {
+              return system->workload->is_finished ||
+                     system->workload->is_sleep;
+            });
+        const auto report_pending_for = [&](int system_id) {
+          return (!systems[system_id]->workload->is_sleep &&
+                  systems[system_id]->workload->is_finished &&
+                  last_command_iteration[system_id] !=
+                      systems[system_id]->workload->iteration) ||
+                 (workload_ipc_server &&
+                  workload_ipc_server->has_pending_completion(system_id));
+        };
+        const bool completion_report_pending = std::any_of(
+            start_npu_ids.begin(), start_npu_ids.end(), report_pending_for) ||
+            std::any_of(
+                end_npu_ids.begin(), end_npu_ids.end(), report_pending_for);
+        if (!workload_ipc_server && !completion_report_pending &&
+            has_pending_workload_command()) {
+          auto command = decode_workload_command(
+              read_workload_command(), -1);
+          exit = apply_workload_command(command.first, command.second);
+        } else if (workload_ipc_server &&
+            !completion_report_pending &&
+            !has_pending_workload_command()) {
+          // IPC drives idle-time advancement explicitly. Never let host-side
+          // graph preparation latency leak into simulated time while a
+          // collective or another externally driven workload is waiting.
+          wait_for_workload_command();
+        } else if (all_workloads_idle &&
+            !completion_report_pending &&
+            !has_pending_workload_command()) {
+          wait_for_workload_command();
+        } else {
+          event_queue->add_current_time();
+        }
       }
       
       for (std::size_t idx = 0; idx < end_npu_ids.size(); ++idx) {
@@ -231,29 +416,29 @@ int main(int argc, char* argv[]) {
         cout << "Checking End NPU " << npu_id << " ..." << endl;
         // Only proceed if the workload has finished its iteration
         if (!systems[npu_id]->workload->is_sleep && systems[npu_id]->workload->is_finished) {
+          if (last_command_iteration[npu_id] ==
+                  systems[npu_id]->workload->iteration &&
+              (!workload_ipc_server ||
+               (!workload_ipc_server->has_pending_completion(npu_id) &&
+                !has_pending_workload_command()))) {
+            continue;
+          }
           systems[npu_id]->workload->report();
+          if (workload_ipc_server) {
+            const auto cycles = Sys::boostedTick();
+            workload_ipc_server->send_batch_done(
+                npu_id, cycles,
+                cycles - systems[npu_id]->workload->hw_resource->tics_gpu_ops);
+          }
           AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
 
-          std::string new_filename;
-          std::getline(std::cin, new_filename);
-
-          if (new_filename == "pass") {  
-            // Skip to the next npu
-            continue;
-          } 
-          else if (new_filename == "exit") {  
-            // Terminate the entire simulator
-            exit = true;
+          auto command = decode_workload_command(
+              read_workload_command(), npu_id);
+          last_command_iteration[npu_id] =
+              systems[npu_id]->workload->iteration;
+          exit = apply_workload_command(command.first, command.second);
+          if (exit) {
             break;
-          } 
-          else if (new_filename == "done") {
-            // This instance is done. Go to sleep until exit
-            systems[npu_id]->workload->is_sleep = true;
-          }
-          else {  
-            // Add new workload to this system
-            systems[npu_id]->workload
-                ->add_workload(new_filename, {});
           }
         }
       }
@@ -267,29 +452,29 @@ int main(int argc, char* argv[]) {
         // Only proceed if the workload has finished its iteration
         cout << "Checking Managed Systems for Controller NPU " << npu_id << " ..." << endl;
         if (!systems[npu_id]->workload->is_sleep && systems[npu_id]->workload->is_finished) {
+          if (last_command_iteration[npu_id] ==
+                  systems[npu_id]->workload->iteration &&
+              (!workload_ipc_server ||
+               (!workload_ipc_server->has_pending_completion(npu_id) &&
+                !has_pending_workload_command()))) {
+            continue;
+          }
           systems[npu_id]->workload->report();
+          if (workload_ipc_server) {
+            const auto cycles = Sys::boostedTick();
+            workload_ipc_server->send_batch_done(
+                npu_id, cycles,
+                cycles - systems[npu_id]->workload->hw_resource->tics_gpu_ops);
+          }
           AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
 
-          std::string new_filename;
-          std::getline(std::cin, new_filename);
-
-          if (new_filename == "pass") {  
-            // Skip to the next npu
-            continue;
-          } 
-          else if (new_filename == "exit") {  
-            // Terminate the entire simulator
-            exit = true;
+          auto command = decode_workload_command(
+              read_workload_command(), npu_id);
+          last_command_iteration[npu_id] =
+              systems[npu_id]->workload->iteration;
+          exit = apply_workload_command(command.first, command.second);
+          if (exit) {
             break;
-          } 
-          else if (new_filename == "done") {
-            // This instance is done. Go to sleep until exit
-            systems[npu_id]->workload->is_sleep = true;
-          }
-          else {  
-            // Add new workload to the systems handled by this npu
-            systems[npu_id]->workload
-                ->add_workload(new_filename, managed_systems[idx]);
           }
         }
       }

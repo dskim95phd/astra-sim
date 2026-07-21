@@ -14,7 +14,7 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/system/Callable.hh"
 #include "astra-sim/system/CommunicatorGroup.hh"
 #include "astra-sim/workload/HardwareResource.hh"
-#include "extern/graph_frontend/chakra/src/feeder/et_feeder.h"
+#include "astra-sim/workload/WorkloadFeeder.hh"
 
 namespace AstraSim {
 
@@ -43,12 +43,14 @@ class Workload : public Callable {
     void call(EventType event, CallData* data);
     void fire();
     void add_workload(const std::string& new_filename, const std::vector<Sys*>& systems);
+    void install_prepared_workload(
+        std::unique_ptr<WorkloadFeeder> feeder);
     void sleep_workload(const std::vector<Sys*>& systems);
 
     // stats
     void report();
 
-    Chakra::ETFeeder* et_feeder;
+    WorkloadFeeder* et_feeder;
     CommunicatorGroup* comm_group;
     HardwareResource* hw_resource;
     Sys* sys;

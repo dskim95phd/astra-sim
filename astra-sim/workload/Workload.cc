@@ -5,7 +5,9 @@ LICENSE file in the root directory of this source tree.
 
 #include "astra-sim/workload/Workload.hh"
 
+
 #include "astra-sim/common/Logging.hh"
+#include "astra-sim/workload/FileWorkloadFeeder.hh"
 #include "astra-sim/system/IntData.hh"
 #include "astra-sim/system/MemEventHandlerData.hh"
 #include "astra-sim/system/RecvPacketEventHandlerData.hh"
@@ -45,7 +47,7 @@ Workload::Workload(Sys* sys, string et_filename, string comm_group_filename) {
         LoggerFactory::get_logger("workload")->critical(error_msg);
         exit(EXIT_FAILURE);
     }
-    this->et_feeder = new ETFeeder(workload_filename);
+    this->et_feeder = new FileWorkloadFeeder(workload_filename);
     this->comm_group = nullptr;
     this->hw_resource = new HardwareResource(1);
     this->sys = sys;
@@ -466,7 +468,7 @@ void Workload::call(EventType event, CallData* data) {
             // there exists new workload, change the ETFeeder
             if (this->et_feeder != nullptr)
                 delete this->et_feeder;
-            this->et_feeder = new ETFeeder(next_workload);
+            this->et_feeder = new FileWorkloadFeeder(next_workload);
             iteration++;
             is_finished = false;
             // fire next iteration
@@ -507,7 +509,8 @@ void Workload::add_workload(const std::string& new_filename,
             // if the workload is finished, we can directly change the ETFeeder
             if (managed_sys->workload->et_feeder != nullptr)
                 delete managed_sys->workload->et_feeder;
-            managed_sys->workload->et_feeder = new ETFeeder(workload_filename);
+            managed_sys->workload->et_feeder =
+                new FileWorkloadFeeder(workload_filename);
             managed_sys->workload->iteration++;
             managed_sys->workload->is_finished = false;
             // fire next iteration
@@ -538,11 +541,26 @@ void Workload::add_workload(const std::string& new_filename,
     // there exists new workload, change the ETFeeder
     if (this->et_feeder != nullptr)
       delete this->et_feeder;
-    this->et_feeder = new ETFeeder(workload_filename);
+    this->et_feeder = new FileWorkloadFeeder(workload_filename);
     iteration++;
     is_finished = false;
     // fire next iteration
     fire();
+}
+
+void Workload::install_prepared_workload(
+    std::unique_ptr<WorkloadFeeder> feeder) {
+    if (!is_finished || !pending_workloads.empty()) {
+        throw std::runtime_error(
+            "Cannot install a prepared workload while another workload is active");
+    }
+    if (feeder == nullptr) {
+        throw std::invalid_argument("Prepared workload feeder is null");
+    }
+    delete et_feeder;
+    et_feeder = feeder.release();
+    ++iteration;
+    is_finished = false;
 }
 
 void Workload::sleep_workload(const std::vector<Sys*>& systems) {

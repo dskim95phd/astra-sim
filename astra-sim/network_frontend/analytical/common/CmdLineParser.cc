@@ -44,7 +44,9 @@ void CmdLineParser::define_options() noexcept {
         cxxopts::value<std::vector<int>>()->default_value("-1"))(
         "end-npu-ids",
         "End NPU id list (comma-separated)",
-        cxxopts::value<std::vector<int>>()->default_value("-1"));
+        cxxopts::value<std::vector<int>>()->default_value("-1"))(
+        "workload-ipc-socket", "Unix socket for workload control IPC",
+        cxxopts::value<std::string>()->default_value(""));
 }
 
 void CmdLineParser::parse(int argc, char* argv[]) noexcept {
