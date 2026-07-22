@@ -29,15 +29,21 @@ using namespace std;
 using json = nlohmann::json;
 
 
+static const std::string& tmp_memory_dir() {
+  static const std::string dir =
+      "tmp_mem_" + std::to_string(static_cast<long long>(::getpid()));
+  return dir;
+}
+
 static std::string save_json_to_tmp(const json& j, const std::string& name) {
-  const char* dir = "tmp_mem";
-  if (::mkdir(dir, 0755) == -1) {
+  const auto& dir = tmp_memory_dir();
+  if (::mkdir(dir.c_str(), 0755) == -1) {
     if (errno != EEXIST) {
       std::perror("mkdir tmp_mem");
       std::exit(1);
     }
   }
-  std::string path = std::string(dir) + "/" + name + ".json";
+  std::string path = dir + "/" + name + ".json";
   std::ofstream ofs(path);
   if (!ofs) {
     std::cerr << "Unable to write tmp file: " << path << "\n";
@@ -153,7 +159,7 @@ int main(int argc, char* argv[]) {
         std::remove(path.c_str()); 
       }
 
-      ::rmdir("tmp_mem");
+      ::rmdir(tmp_memory_dir().c_str());
     }
 
     auto memory_apis = std::vector<AstraMemoryAPI*>();
