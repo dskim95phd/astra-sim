@@ -30,6 +30,7 @@ class HardwareResource {
     uint32_t num_in_flight_cpu_ops;
     uint32_t num_in_flight_gpu_comp_ops;
     uint32_t num_in_flight_gpu_comm_ops;
+    uint32_t num_in_flight_mem_ops;
 
     uint64_t num_cpu_ops;
     uint64_t num_gpu_ops;

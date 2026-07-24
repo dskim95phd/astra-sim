@@ -7,9 +7,11 @@ LICENSE file in the root directory of this source tree.
 #define __WORKLOAD_HH__
 
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <queue>
+#include <utility>
 
 #include "astra-sim/system/Callable.hh"
 #include "astra-sim/system/CommunicatorGroup.hh"
@@ -20,6 +22,12 @@ namespace AstraSim {
 
 class Sys;
 class DataSet;
+
+struct PreparedWorkloadCompletion {
+    uint32_t iteration;
+    uint64_t cycles;
+    uint64_t exposed_communication_cycles;
+};
 
 class Workload : public Callable {
   public:
@@ -43,12 +51,16 @@ class Workload : public Callable {
     void call(EventType event, CallData* data);
     void fire();
     void add_workload(const std::string& new_filename, const std::vector<Sys*>& systems);
-    void install_prepared_workload(
-        std::unique_ptr<WorkloadFeeder> feeder);
+    bool install_prepared_workload(
+        std::unique_ptr<WorkloadFeeder> feeder,
+        bool report_completion);
+    bool has_prepared_completion() const;
+    PreparedWorkloadCompletion take_prepared_completion();
     void sleep_workload(const std::vector<Sys*>& systems);
 
     // stats
     void report();
+    void report(const PreparedWorkloadCompletion& completion);
 
     WorkloadFeeder* et_feeder;
     CommunicatorGroup* comm_group;
@@ -62,6 +74,11 @@ class Workload : public Callable {
 
     bool is_sleep;
     std::queue<std::string> pending_workloads;
+    std::queue<std::pair<std::unique_ptr<WorkloadFeeder>, bool>>
+        pending_prepared_workloads;
+    std::queue<PreparedWorkloadCompletion> prepared_completions;
+    bool active_workload_is_prepared;
+    bool report_active_prepared_completion;
 };
 
 }  // namespace AstraSim

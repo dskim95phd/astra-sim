@@ -17,6 +17,7 @@ LICENSE file in the root directory of this source tree.
 #include <limits>
 #include <poll.h>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace AstraSimAnalytical {
@@ -343,16 +344,35 @@ bool WorkloadIpcServer::prepare_batch(
         throw std::runtime_error("Invalid RUN_BATCH payload");
     }
 
+    std::vector<std::uint32_t> appended_completions;
     try {
         prepared_batch_.emplace(template_registry_.prepare_batch(request));
         if (request.execute()) {
-            for (const auto& system : prepared_batch_->systems) {
-                pending_completions_.insert_or_assign(
-                    system.system_id,
+            if (prepared_batch_->systems.empty()) {
+                throw std::invalid_argument(
+                    "RUN_BATCH prepared no systems");
+            }
+            const auto endpoints = std::minmax_element(
+                prepared_batch_->systems.begin(),
+                prepared_batch_->systems.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.system_id < rhs.system_id;
+                });
+            const std::array<std::uint32_t, 2> reporting_systems = {
+                endpoints.first->system_id,
+                endpoints.second->system_id,
+            };
+            for (const auto system_id : reporting_systems) {
+                if (!appended_completions.empty() &&
+                    appended_completions.back() == system_id) {
+                    continue;
+                }
+                pending_completions_[system_id].push_back(
                     PendingCompletion{
                         prepared_batch_->request_id,
                         prepared_batch_->batch_id,
                     });
+                appended_completions.push_back(system_id);
             }
         }
         llmservingsim::ipc::BatchAccepted response;
@@ -368,9 +388,15 @@ bool WorkloadIpcServer::prepare_batch(
             std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
         return request.execute();
     } catch (const std::exception& error) {
-        if (prepared_batch_.has_value()) {
-            for (const auto& system : prepared_batch_->systems) {
-                pending_completions_.erase(system.system_id);
+        for (auto system_id = appended_completions.rbegin();
+             system_id != appended_completions.rend(); ++system_id) {
+            auto completions = pending_completions_.find(*system_id);
+            if (completions != pending_completions_.end() &&
+                !completions->second.empty()) {
+                completions->second.pop_back();
+                if (completions->second.empty()) {
+                    pending_completions_.erase(completions);
+                }
             }
         }
         prepared_batch_.reset();
@@ -395,13 +421,15 @@ bool WorkloadIpcServer::prepare_wave(
         throw std::runtime_error("Empty RUN_WAVE");
     }
 
+    std::vector<std::pair<std::uint32_t, PendingCompletion>> completions;
+    std::vector<std::uint32_t> appended_completions;
     try {
         PreparedBatch merged{
             request.request_id(),
             request.wave_id(),
             0,
         };
-        std::unordered_map<std::uint32_t, PendingCompletion> completions;
+        std::unordered_set<std::uint32_t> participant_systems;
         for (const auto& run : request.runs()) {
             llmservingsim::ipc::RunBatch batch_request;
             batch_request.set_request_id(request.request_id());
@@ -409,25 +437,43 @@ bool WorkloadIpcServer::prepare_wave(
             batch_request.set_execute(true);
             batch_request.mutable_patch()->CopyFrom(run.patch());
             auto participant = template_registry_.prepare_batch(batch_request);
+            if (participant.systems.empty()) {
+                throw std::invalid_argument(
+                    "RUN_WAVE participant prepared no systems");
+            }
             merged.patched_value_count += participant.patched_value_count;
+            const auto endpoints = std::minmax_element(
+                participant.systems.begin(), participant.systems.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.system_id < rhs.system_id;
+                });
+            const auto first_system_id = endpoints.first->system_id;
+            const auto last_system_id = endpoints.second->system_id;
             for (auto& system : participant.systems) {
-                if (completions.count(system.system_id) != 0) {
+                if (!participant_systems.insert(system.system_id).second) {
                     throw std::invalid_argument(
                         "RUN_WAVE participants overlap on a system");
                 }
-                completions.emplace(
-                    system.system_id,
+                merged.systems.push_back(std::move(system));
+            }
+            completions.emplace_back(
+                first_system_id,
+                PendingCompletion{
+                    request.request_id(), participant.batch_id});
+            if (last_system_id != first_system_id) {
+                completions.emplace_back(
+                    last_system_id,
                     PendingCompletion{
                         request.request_id(), participant.batch_id});
-                merged.systems.push_back(std::move(system));
             }
         }
 
         // Commit only after every participant has validated successfully.
         prepared_batch_.emplace(std::move(merged));
         for (const auto& completion : completions) {
-            pending_completions_.insert_or_assign(
-                completion.first, completion.second);
+            pending_completions_[completion.first].push_back(
+                completion.second);
+            appended_completions.push_back(completion.first);
         }
         llmservingsim::ipc::BatchAccepted response;
         response.set_request_id(request.request_id());
@@ -442,6 +488,17 @@ bool WorkloadIpcServer::prepare_wave(
             std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
         return true;
     } catch (const std::exception& error) {
+        for (auto system_id = appended_completions.rbegin();
+             system_id != appended_completions.rend(); ++system_id) {
+            auto pending = pending_completions_.find(*system_id);
+            if (pending != pending_completions_.end() &&
+                !pending->second.empty()) {
+                pending->second.pop_back();
+                if (pending->second.empty()) {
+                    pending_completions_.erase(pending);
+                }
+            }
+        }
         prepared_batch_.reset();
         send_error(error.what());
         throw;
@@ -453,13 +510,14 @@ bool WorkloadIpcServer::send_batch_done(
     std::uint64_t cycles,
     std::uint64_t exposed_communication_cycles) {
     const auto completion = pending_completions_.find(system_id);
-    if (completion == pending_completions_.end()) {
+    if (completion == pending_completions_.end() ||
+        completion->second.empty()) {
         return false;
     }
     llmservingsim::ipc::BatchDone response;
-    response.set_request_id(completion->second.request_id);
+    response.set_request_id(completion->second.front().request_id);
     response.set_system_id(system_id);
-    response.set_batch_id(completion->second.batch_id);
+    response.set_batch_id(completion->second.front().batch_id);
     response.set_cycles(cycles);
     response.set_exposed_communication_cycles(
         exposed_communication_cycles);
@@ -467,13 +525,18 @@ bool WorkloadIpcServer::send_batch_done(
     send_frame(
         WorkloadMessageType::BatchDone,
         std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
-    pending_completions_.erase(completion);
+    completion->second.pop_front();
+    if (completion->second.empty()) {
+        pending_completions_.erase(completion);
+    }
     return true;
 }
 
 bool WorkloadIpcServer::has_pending_completion(
     std::uint32_t system_id) const {
-    return pending_completions_.count(system_id) != 0;
+    const auto completion = pending_completions_.find(system_id);
+    return completion != pending_completions_.end() &&
+           !completion->second.empty();
 }
 
 bool WorkloadIpcServer::has_pending_input() const {

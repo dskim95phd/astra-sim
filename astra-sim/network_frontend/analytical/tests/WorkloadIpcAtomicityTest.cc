@@ -205,8 +205,17 @@ int main() {
             require(prepared.systems.size() == 1 &&
                         prepared.systems.front().system_id == 0,
                     "Valid RUN_BATCH prepared the wrong systems");
+            require(server.receive_file_command() ==
+                        std::string("@0\t") +
+                            WorkloadIpcServer::kPreparedBatchCommand,
+                    "Queued RUN_BATCH did not execute");
+            const auto queued = server.take_prepared_batch();
+            require(queued.batch_id == 13,
+                    "Queued RUN_BATCH prepared the wrong batch");
             require(server.send_batch_done(0, 123, 7),
-                    "Valid RUN_BATCH completion was not correlated");
+                    "First RUN_BATCH completion was not correlated");
+            require(server.send_batch_done(0, 456, 9),
+                    "Queued RUN_BATCH completion was not correlated");
         } catch (...) {
             server_error = std::current_exception();
         }
@@ -271,9 +280,34 @@ int main() {
         require(receive_frame(client_fd).type ==
                     WorkloadMessageType::BatchAccepted,
                 "Valid RUN_BATCH was not accepted after rejection");
-        const auto done_frame = receive_frame(client_fd);
-        require(done_frame.type == WorkloadMessageType::BatchDone,
-                "Valid RUN_BATCH did not emit BATCH_DONE");
+
+        batch.set_request_id(4);
+        batch.mutable_patch()->set_batch_id(13);
+        send_frame(
+            client_fd, WorkloadMessageType::RunBatch,
+            batch.SerializeAsString());
+        require(receive_frame(client_fd).type ==
+                    WorkloadMessageType::BatchAccepted,
+                "Queued RUN_BATCH was not accepted");
+
+        const auto first_done_frame = receive_frame(client_fd);
+        require(first_done_frame.type == WorkloadMessageType::BatchDone,
+                "First RUN_BATCH did not emit BATCH_DONE");
+        llmservingsim::ipc::BatchDone first_done;
+        require(first_done.ParseFromArray(
+                    first_done_frame.payload.data(),
+                    first_done_frame.payload.size()) &&
+                    first_done.batch_id() == 12,
+                "First RUN_BATCH completion lost FIFO identity");
+        const auto queued_done_frame = receive_frame(client_fd);
+        require(queued_done_frame.type == WorkloadMessageType::BatchDone,
+                "Queued RUN_BATCH did not emit BATCH_DONE");
+        llmservingsim::ipc::BatchDone queued_done;
+        require(queued_done.ParseFromArray(
+                    queued_done_frame.payload.data(),
+                    queued_done_frame.payload.size()) &&
+                    queued_done.batch_id() == 13,
+                "Queued RUN_BATCH completion lost FIFO identity");
     } catch (...) {
         if (client_fd >= 0) {
             ::close(client_fd);

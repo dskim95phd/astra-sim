@@ -277,10 +277,14 @@ int main(int argc, char* argv[]) {
           throw std::out_of_range("Prepared batch system id is out of range");
         }
         auto* workload = systems[prepared_system.system_id]->workload;
-        workload->install_prepared_workload(
+        const bool started = workload->install_prepared_workload(
             std::make_unique<AstraSim::PreparedFeeder>(
-                std::move(prepared_system.iteration)));
-        workloads.emplace_back(workload);
+                std::move(prepared_system.iteration)),
+            workload_ipc_server->has_pending_completion(
+                prepared_system.system_id));
+        if (started) {
+          workloads.emplace_back(workload);
+        }
       }
       for (auto* workload : workloads) {
         workload->fire();
@@ -379,12 +383,13 @@ int main(int argc, char* argv[]) {
                      system->workload->is_sleep;
             });
         const auto report_pending_for = [&](int system_id) {
-          return (!systems[system_id]->workload->is_sleep &&
+          return (workload_ipc_server &&
+                  systems[system_id]->workload
+                      ->has_prepared_completion()) ||
+                 (!systems[system_id]->workload->is_sleep &&
                   systems[system_id]->workload->is_finished &&
                   last_command_iteration[system_id] !=
-                      systems[system_id]->workload->iteration) ||
-                 (workload_ipc_server &&
-                  workload_ipc_server->has_pending_completion(system_id));
+                      systems[system_id]->workload->iteration);
         };
         const bool completion_report_pending = std::any_of(
             start_npu_ids.begin(), start_npu_ids.end(), report_pending_for) ||
@@ -420,6 +425,12 @@ int main(int argc, char* argv[]) {
           return;
         }
         const auto* workload = systems[npu_id]->workload;
+        if (workload_ipc_server) {
+          if (workload->has_prepared_completion()) {
+            completion_frontier.push_back(npu_id);
+            return;
+          }
+        }
         if (workload->is_sleep || !workload->is_finished) {
           return;
         }
@@ -441,12 +452,16 @@ int main(int argc, char* argv[]) {
       }
 
       for (int npu_id : completion_frontier) {
-        systems[npu_id]->workload->report();
-        if (workload_ipc_server) {
-          const auto cycles = Sys::boostedTick();
+        if (workload_ipc_server &&
+            systems[npu_id]->workload->has_prepared_completion()) {
+          const auto completion = systems[npu_id]->workload
+              ->take_prepared_completion();
+          systems[npu_id]->workload->report(completion);
           workload_ipc_server->send_batch_done(
-              npu_id, cycles,
-              cycles - systems[npu_id]->workload->hw_resource->tics_gpu_ops);
+              npu_id, completion.cycles,
+              completion.exposed_communication_cycles);
+        } else {
+          systems[npu_id]->workload->report();
         }
         AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
       }

@@ -6,6 +6,7 @@ LICENSE file in the root directory of this source tree.
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -77,7 +78,7 @@ class WorkloadIpcServer {
         std::uint64_t request_id;
         std::uint64_t batch_id;
     };
-    std::unordered_map<std::uint32_t, PendingCompletion>
+    std::unordered_map<std::uint32_t, std::deque<PendingCompletion>>
         pending_completions_;
 };
 

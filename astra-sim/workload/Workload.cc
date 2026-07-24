@@ -17,6 +17,7 @@ LICENSE file in the root directory of this source tree.
 #include <json/json.hpp>
 
 #include <iostream>
+#include <stdexcept>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -56,6 +57,8 @@ Workload::Workload(Sys* sys, string et_filename, string comm_group_filename) {
     this->iteration = 0;
     this->filename = et_filename;
     this->is_sleep = false;
+    this->active_workload_is_prepared = false;
+    this->report_active_prepared_completion = false;
 }
 
 Workload::~Workload() {
@@ -460,9 +463,32 @@ void Workload::call(EventType event, CallData* data) {
     if (!et_feeder->hasNodesToIssue() &&
         (hw_resource->num_in_flight_cpu_ops == 0) &&
         (hw_resource->num_in_flight_gpu_comp_ops == 0) &&
-        (hw_resource->num_in_flight_gpu_comm_ops == 0) ) {
+        (hw_resource->num_in_flight_gpu_comm_ops == 0) &&
+        (hw_resource->num_in_flight_mem_ops == 0) ) {
         // report();
-        if (!pending_workloads.empty()) {
+        if (active_workload_is_prepared &&
+            report_active_prepared_completion) {
+            const auto cycles = Sys::boostedTick();
+            prepared_completions.push(PreparedWorkloadCompletion{
+                iteration,
+                cycles,
+                cycles - hw_resource->tics_gpu_ops,
+            });
+        }
+        active_workload_is_prepared = false;
+        report_active_prepared_completion = false;
+
+        if (!pending_prepared_workloads.empty()) {
+            auto next_workload = std::move(pending_prepared_workloads.front());
+            pending_prepared_workloads.pop();
+            delete et_feeder;
+            et_feeder = next_workload.first.release();
+            active_workload_is_prepared = true;
+            report_active_prepared_completion = next_workload.second;
+            iteration++;
+            is_finished = false;
+            fire();
+        } else if (!pending_workloads.empty()) {
             string next_workload = pending_workloads.front();
             pending_workloads.pop();
             // there exists new workload, change the ETFeeder
@@ -548,19 +574,49 @@ void Workload::add_workload(const std::string& new_filename,
     fire();
 }
 
-void Workload::install_prepared_workload(
-    std::unique_ptr<WorkloadFeeder> feeder) {
-    if (!is_finished || !pending_workloads.empty()) {
-        throw std::runtime_error(
-            "Cannot install a prepared workload while another workload is active");
-    }
+bool Workload::install_prepared_workload(
+    std::unique_ptr<WorkloadFeeder> feeder,
+    bool report_completion) {
     if (feeder == nullptr) {
         throw std::invalid_argument("Prepared workload feeder is null");
+    }
+    if (!pending_workloads.empty()) {
+        throw std::runtime_error(
+            "Cannot mix prepared and file workload queues");
+    }
+    if (!is_finished) {
+        if (!active_workload_is_prepared) {
+            throw std::runtime_error(
+                "Cannot queue a prepared workload behind a file workload");
+        }
+        pending_prepared_workloads.emplace(
+            std::move(feeder), report_completion);
+        return false;
+    }
+    if (!pending_prepared_workloads.empty()) {
+        throw std::runtime_error(
+            "Prepared workload queue is inconsistent with idle state");
     }
     delete et_feeder;
     et_feeder = feeder.release();
     ++iteration;
     is_finished = false;
+    active_workload_is_prepared = true;
+    report_active_prepared_completion = report_completion;
+    return true;
+}
+
+bool Workload::has_prepared_completion() const {
+    return !prepared_completions.empty();
+}
+
+PreparedWorkloadCompletion Workload::take_prepared_completion() {
+    if (prepared_completions.empty()) {
+        throw std::runtime_error("No prepared workload completion is available");
+    }
+    auto completion = prepared_completions.front();
+    prepared_completions.pop();
+    return completion;
 }
 
 void Workload::sleep_workload(const std::vector<Sys*>& systems) {
@@ -587,4 +643,11 @@ void Workload::report() {
     LoggerFactory::get_logger("workload")
         ->info("sys[{}] iteration {} finished, {} cycles, exposed communication {} cycles.",
                sys->id, iteration, curr_tick, curr_tick - hw_resource->tics_gpu_ops);
+}
+
+void Workload::report(const PreparedWorkloadCompletion& completion) {
+    LoggerFactory::get_logger("workload")
+        ->info("sys[{}] iteration {} finished, {} cycles, exposed communication {} cycles.",
+               sys->id, completion.iteration, completion.cycles,
+               completion.exposed_communication_cycles);
 }
